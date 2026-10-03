@@ -1,72 +1,63 @@
-import React, { useState, useEffect } from 'react';
-import { GameState, Question } from '../types/game';
+import React, { useState, useEffect, useMemo } from 'react';
+import type { LiveSnapshot } from '../services/liveSync';
 import { liveSync } from '../services/liveSync';
 import { sfx } from '../services/soundEffects';
-import { ShieldAlert, Play, Pause, RotateCcw, Sliders, Plus, Trash2, Flame, Lock, KeyRound, LogOut, CheckCircle } from 'lucide-react';
-
-interface AdminPanelProps {
-  gameState: GameState;
-  questions: Question[];
-}
+import { useCountdown } from '../hooks/useLiveGame';
+import { computeRanking } from '../lib/scoring';
+import {
+  ShieldAlert,
+  Play,
+  Pause,
+  RotateCcw,
+  Sliders,
+  Plus,
+  Trash2,
+  Flame,
+  KeyRound,
+  LogOut,
+  Sparkles,
+  Users,
+  Eye,
+  CheckCircle2,
+  RefreshCw,
+  Clock,
+  ArrowUp,
+  ArrowDown
+} from 'lucide-react';
 
 const SECRET_PIN = 'isaam';
 
-export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) => {
+export const AdminPanel: React.FC<{ live: LiveSnapshot }> = ({ live }) => {
+  const { state, questions, submissions } = live;
+
   const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
     return sessionStorage.getItem('PARIVAR_ADMIN_AUTH') === 'true';
   });
   const [pinInput, setPinInput] = useState('');
   const [pinError, setPinError] = useState(false);
 
-  const currentQuestion = questions.find((q) => q.id === gameState.currentQuestionId) || questions[0];
+  // Activate admin self-healing mode once authenticated
+  useEffect(() => {
+    if (isAuthenticated) {
+      liveSync.enableAdminMode();
+    }
+  }, [isAuthenticated]);
 
-  // Local state for God Mode overrides
-  const [optionOverrides, setOptionOverrides] = useState<Record<string, number>>({});
-  const [stageGuyName, setStageGuyName] = useState<string>(gameState.stagePlayerName);
+  const currentQuestion = questions.find((q) => q.id === state.currentQuestionId) || questions[0];
+  const ranking = useMemo(() => computeRanking(currentQuestion, submissions), [currentQuestion, submissions]);
+  const voteCount = submissions.filter((s) => s.questionId === currentQuestion.id).length;
+  const remaining = useCountdown(state);
 
-  // New question form state
+  const [stageGuyNameInput, setStageGuyNameInput] = useState(state.stagePlayerName);
+  const [timerDurationInput, setTimerDurationInput] = useState(state.timerDuration);
+
+  // New question state
   const [isAddingQuestion, setIsAddingQuestion] = useState(false);
   const [newTitle, setNewTitle] = useState('');
-  const [newCategory, setNewCategory] = useState<'Gandhi Special' | 'Indian Parivar' | 'Dark Satire'>('Gandhi Special');
+  const [newCategory, setNewCategory] = useState('Gandhi Special');
   const [newTrivia, setNewTrivia] = useState('');
   const [newCommentary, setNewCommentary] = useState('');
   const [newOptionsText, setNewOptionsText] = useState(['Option 1', 'Option 2', 'Option 3', 'Option 4', 'Option 5']);
-
-  // Sync initial overrides
-  useEffect(() => {
-    if (currentQuestion) {
-      const initial: Record<string, number> = {};
-      currentQuestion.options.forEach((o) => {
-        initial[o.id] = o.manipulatedPercentage !== undefined ? o.manipulatedPercentage : o.presetPercentage;
-      });
-      setOptionOverrides(initial);
-    }
-  }, [currentQuestion]);
-
-  // Timer interval effect
-  useEffect(() => {
-    let interval: NodeJS.Timeout | null = null;
-    if (gameState.isTimerRunning && gameState.timerSeconds > 0) {
-      interval = setInterval(() => {
-        const nextTime = gameState.timerSeconds - 1;
-        liveSync.saveGameState({
-          ...gameState,
-          timerSeconds: nextTime,
-          isTimerRunning: nextTime > 0,
-          phase: nextTime === 0 ? 'LOCKED' : gameState.phase,
-        });
-
-        if (nextTime <= 5 && nextTime > 0) {
-          sfx.playTick();
-        } else if (nextTime === 0) {
-          sfx.playBuzzer();
-        }
-      }, 1000);
-    }
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [gameState]);
 
   const handlePinSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -104,6 +95,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
           <form onSubmit={handlePinSubmit} className="space-y-4">
             <div>
               <input
+                id="admin-pin-input"
                 type="password"
                 required
                 placeholder="Enter Secret PIN"
@@ -124,6 +116,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
             </div>
 
             <button
+              id="admin-pin-submit"
               type="submit"
               className="w-full py-3.5 rounded-2xl font-bold bg-gradient-to-r from-red-600 via-amber-600 to-red-500 text-white shadow-xl shadow-red-500/20 hover:brightness-110 active:scale-[0.99] transition text-sm"
             >
@@ -135,120 +128,118 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
     );
   }
 
+  // --- ACTIONS ---
   const handleSelectQuestion = (qId: string) => {
-    liveSync.saveGameState({
-      ...gameState,
+    liveSync.updateState({
       currentQuestionId: qId,
       revealedOptionIds: [],
-      timerSeconds: 60,
-      isTimerRunning: false,
+      timerEndsAt: null,
+      timerRemaining: state.timerDuration,
       phase: 'VOTING',
     });
     sfx.playDing();
   };
 
-  const handleToggleTimer = () => {
-    const nextState = !gameState.isTimerRunning;
-    liveSync.saveGameState({
-      ...gameState,
-      isTimerRunning: nextState,
+  const handleStartVoting = () => {
+    const duration = timerDurationInput || 60;
+    liveSync.updateState({
+      timerDuration: duration,
+      timerEndsAt: Date.now() + duration * 1000,
+      timerRemaining: duration,
+      phase: 'VOTING',
     });
-    if (nextState) sfx.playDing();
+    sfx.playDing();
+  };
+
+  const handlePauseTimer = () => {
+    if (state.timerEndsAt) {
+      liveSync.updateState({
+        timerEndsAt: null,
+        timerRemaining: remaining,
+      });
+    } else {
+      liveSync.updateState({
+        timerEndsAt: Date.now() + state.timerRemaining * 1000,
+      });
+    }
+    sfx.playDing();
   };
 
   const handleResetTimer = () => {
-    liveSync.saveGameState({
-      ...gameState,
-      timerSeconds: 60,
-      isTimerRunning: false,
+    liveSync.updateState({
+      timerEndsAt: null,
+      timerRemaining: state.timerDuration,
     });
   };
 
-  const handlePhaseChange = (phase: GameState['phase']) => {
-    liveSync.saveGameState({
-      ...gameState,
-      phase,
-    });
+  const handlePhaseChange = (phase: typeof state.phase) => {
+    liveSync.updateState({ phase });
     sfx.playFlip();
+  };
+
+  const handlePercentageChange = (optionId: string, val: number) => {
+    liveSync.setQuestions((qs) =>
+      qs.map((q) => {
+        if (q.id === currentQuestion.id) {
+          return {
+            ...q,
+            options: q.options.map((o) => (o.id === optionId ? { ...o, manipulatedPercentage: val } : o)),
+          };
+        }
+        return q;
+      })
+    );
+  };
+
+  const resetManipulations = () => {
+    liveSync.setQuestions((qs) =>
+      qs.map((q) => {
+        if (q.id === currentQuestion.id) {
+          return {
+            ...q,
+            options: q.options.map((o) => ({ ...o, manipulatedPercentage: undefined })),
+          };
+        }
+        return q;
+      })
+    );
+    sfx.playDing();
   };
 
   const handleUpdateStageGuy = (e: React.FormEvent) => {
     e.preventDefault();
-    liveSync.saveGameState({
-      ...gameState,
-      stagePlayerName: stageGuyName,
-    });
+    liveSync.updateState({ stagePlayerName: stageGuyNameInput });
     sfx.playDing();
   };
 
-  // God Mode: Manipulate Option Percentage Override
-  const handlePercentageChange = (optionId: string, val: number) => {
-    const updatedOverrides = { ...optionOverrides, [optionId]: val };
-    setOptionOverrides(updatedOverrides);
-
-    const updatedQuestions = questions.map((q) => {
-      if (q.id === currentQuestion.id) {
-        return {
-          ...q,
-          options: q.options.map((o) => {
-            if (o.id === optionId) {
-              return { ...o, manipulatedPercentage: val };
-            }
-            return o;
-          }),
-        };
-      }
-      return q;
-    });
-
-    liveSync.saveQuestions(updatedQuestions);
-    liveSync.saveGameState({
-      ...gameState,
-      godModeEnabled: true,
-    });
-  };
-
-  const resetManipulations = () => {
-    const updatedQuestions = questions.map((q) => {
-      if (q.id === currentQuestion.id) {
-        return {
-          ...q,
-          options: q.options.map((o) => ({ ...o, manipulatedPercentage: undefined })),
-        };
-      }
-      return q;
-    });
-
-    const resetOverrides: Record<string, number> = {};
-    currentQuestion.options.forEach((o) => {
-      resetOverrides[o.id] = o.presetPercentage;
-    });
-
-    setOptionOverrides(resetOverrides);
-    liveSync.saveQuestions(updatedQuestions);
-    sfx.playDing();
+  const handleSetStageGuessOrder = (optionIdOrder: string[]) => {
+    liveSync.updateState((s) => ({
+      stageGuesses: {
+        ...s.stageGuesses,
+        [currentQuestion.id]: optionIdOrder,
+      },
+    }));
   };
 
   const handleSaveNewQuestion = (e: React.FormEvent) => {
     e.preventDefault();
     if (!newTitle.trim()) return;
 
-    const newQ: Question = {
-      id: 'q_' + Math.random().toString(36).substring(2, 9),
+    const newQ = {
+      id: 'q_' + Math.random().toString(36).slice(2, 9),
       title: newTitle.trim(),
-      category: newCategory,
+      category: newCategory.trim() || 'Gandhi Special',
       darkHumorTrivia: newTrivia.trim() || undefined,
       bapuCommentary: newCommentary.trim() || undefined,
       options: newOptionsText.map((txt, idx) => ({
-        id: `opt_${Math.random().toString(36).substring(2, 7)}`,
+        id: `opt_${Math.random().toString(36).slice(2, 7)}`,
         text: txt.trim() || `Option ${idx + 1}`,
         presetPercentage: Math.max(5, 40 - idx * 8),
-        presetPoints: Math.max(5, 40 - idx * 8),
+        presetPoints: 20,
       })),
     };
 
-    const updated = [...questions, newQ];
-    liveSync.saveQuestions(updated);
+    liveSync.setQuestions((prev) => [...prev, newQ]);
     setIsAddingQuestion(false);
     setNewTitle('');
     setNewTrivia('');
@@ -258,14 +249,21 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
 
   const handleDeleteQuestion = (qId: string) => {
     if (questions.length <= 1) return;
-    const updated = questions.filter((q) => q.id !== qId);
-    liveSync.saveQuestions(updated);
-    if (gameState.currentQuestionId === qId) {
-      liveSync.saveGameState({
-        ...gameState,
-        currentQuestionId: updated[0].id,
-      });
+    liveSync.setQuestions((qs) => qs.filter((q) => q.id !== qId));
+    if (state.currentQuestionId === qId) {
+      const remainingQs = questions.filter((q) => q.id !== qId);
+      liveSync.updateState({ currentQuestionId: remainingQs[0].id });
     }
+  };
+
+  const currentStageGuess = state.stageGuesses[currentQuestion.id] || currentQuestion.options.map((o) => o.id);
+
+  const moveStageOption = (idx: number, dir: -1 | 1) => {
+    const target = idx + dir;
+    if (target < 0 || target >= currentStageGuess.length) return;
+    const next = [...currentStageGuess];
+    [next[idx], next[target]] = [next[target], next[idx]];
+    handleSetStageGuessOrder(next);
   };
 
   return (
@@ -281,7 +279,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
               Host Control Center & God Mode Panel
             </h2>
             <p className="text-xs text-slate-400">
-              Control live state, timers, question broadcast, and override majority percentages in real-time.
+              Real-time cross-device sync active. Changes push immediately to stage and audience screens.
             </p>
           </div>
         </div>
@@ -289,12 +287,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
         <div className="flex items-center gap-2">
           {/* Phase Badges */}
           <div className="flex items-center gap-1.5 bg-slate-950 p-1.5 rounded-2xl border border-slate-800 text-xs font-semibold">
-            {(['VOTING', 'LOCKED', 'STAGE_GUESSING', 'REVEALED'] as GameState['phase'][]).map((phase) => (
+            {(['VOTING', 'LOCKED', 'STAGE_GUESSING', 'REVEALED'] as const).map((phase) => (
               <button
                 key={phase}
+                id={`admin-phase-${phase.toLowerCase()}`}
                 onClick={() => handlePhaseChange(phase)}
                 className={`px-3 py-1.5 rounded-xl transition ${
-                  gameState.phase === phase
+                  state.phase === phase
                     ? 'bg-red-500 text-white font-bold shadow-md shadow-red-500/30'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
@@ -305,6 +304,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
           </div>
 
           <button
+            id="admin-logout"
             onClick={handleLogout}
             className="p-2.5 rounded-2xl bg-slate-950 border border-slate-800 text-slate-400 hover:text-red-400 transition"
             title="Lock Admin Panel"
@@ -318,53 +318,70 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
         {/* Left Column: Live State & Timer Controls */}
         <div className="space-y-6">
           {/* Active Timer Card */}
-          <div className="bg-slate-900/80 border border-amber-500/30 rounded-3xl p-5 shadow-xl">
-            <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider mb-3">
+          <div className="bg-slate-900/80 border border-amber-500/30 rounded-3xl p-5 shadow-xl space-y-4">
+            <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider">
               ⏱️ Voting Timer Control
             </h3>
 
-            <div className="text-center py-4 bg-slate-950 rounded-2xl border border-slate-800 mb-4">
-              <span className="font-mono text-4xl sm:text-5xl font-black text-amber-300">
-                {gameState.timerSeconds}s
+            <div className="text-center py-4 bg-slate-950 rounded-2xl border border-slate-800">
+              <span id="admin-timer-display" className="font-mono text-4xl sm:text-5xl font-black text-amber-300">
+                {remaining}s
               </span>
               <p className="text-xs text-slate-500 mt-1 font-semibold">
-                Status: {gameState.isTimerRunning ? 'RUNNING 🟢' : 'PAUSED ⏸️'}
+                Status: {state.timerEndsAt ? 'RUNNING 🟢' : 'PAUSED ⏸️'} | Votes: <span className="text-cyan-300 font-bold">{voteCount}</span>
               </p>
             </div>
 
             <div className="grid grid-cols-2 gap-2">
               <button
-                onClick={handleToggleTimer}
-                className={`py-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition ${
-                  gameState.isTimerRunning
-                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
-                    : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                }`}
+                id="admin-start-voting"
+                onClick={handleStartVoting}
+                className="py-3 rounded-xl font-bold text-xs bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 hover:bg-emerald-500/30 flex items-center justify-center gap-2"
               >
-                {gameState.isTimerRunning ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
-                {gameState.isTimerRunning ? 'Pause Timer' : 'Start Timer'}
+                <Play className="w-4 h-4" /> Start Round Timer
               </button>
 
               <button
-                onClick={handleResetTimer}
-                className="py-3 rounded-xl font-bold text-xs bg-slate-800 border border-slate-700 text-slate-300 hover:text-white flex items-center justify-center gap-2"
+                id="admin-pause-timer"
+                onClick={handlePauseTimer}
+                className="py-3 rounded-xl font-bold text-xs bg-amber-500/20 text-amber-300 border border-amber-500/40 hover:bg-amber-500/30 flex items-center justify-center gap-2"
               >
-                <RotateCcw className="w-4 h-4" /> Reset (60s)
+                <Pause className="w-4 h-4" /> {state.timerEndsAt ? 'Pause' : 'Resume'}
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2 pt-2 border-t border-slate-800">
+              <label htmlFor="admin-timer-duration" className="text-xs text-slate-400 shrink-0">Duration (s):</label>
+              <input
+                id="admin-timer-duration"
+                type="number"
+                min="10"
+                max="300"
+                value={timerDurationInput}
+                onChange={(e) => setTimerDurationInput(parseInt(e.target.value) || 60)}
+                className="w-20 bg-slate-950 border border-slate-700 rounded-lg py-1 px-2 text-xs font-mono text-amber-300"
+              />
+              <button
+                onClick={handleResetTimer}
+                className="ml-auto px-3 py-1 rounded-lg bg-slate-800 text-xs font-bold text-slate-300 hover:text-white flex items-center gap-1"
+              >
+                <RotateCcw className="w-3.5 h-3.5" /> Reset
               </button>
             </div>
           </div>
 
-          {/* Stage Contestant Name Card */}
-          <div className="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-xl">
-            <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider mb-3">
+          {/* Stage Contestant Setup */}
+          <div className="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-xl space-y-4">
+            <h3 className="text-xs font-bold text-amber-400 uppercase tracking-wider">
               🎭 Stage Guy / Contestant Setup
             </h3>
 
             <form onSubmit={handleUpdateStageGuy} className="space-y-3">
               <input
+                id="admin-stage-guy-input"
                 type="text"
-                value={stageGuyName}
-                onChange={(e) => setStageGuyName(e.target.value)}
+                value={stageGuyNameInput}
+                onChange={(e) => setStageGuyNameInput(e.target.value)}
                 placeholder="Contestant Name"
                 className="w-full bg-slate-950 border border-slate-700 rounded-xl py-2.5 px-3.5 text-xs text-amber-100 outline-none focus:border-amber-500"
               />
@@ -372,14 +389,77 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
                 type="submit"
                 className="w-full py-2.5 rounded-xl font-bold text-xs bg-amber-500/20 border border-amber-500/30 text-amber-300 hover:bg-amber-500/30 transition"
               >
-                Update Stage Guy Name
+                Update Contestant Name
               </button>
             </form>
+
+            <div className="pt-3 border-t border-slate-800 space-y-2">
+              <label className="text-xs font-semibold text-slate-400">Contestant's Guessed Order:</label>
+              <div className="space-y-1.5">
+                {currentStageGuess.map((optId, idx) => {
+                  const optText = currentQuestion.options.find((o) => o.id === optId)?.text ?? '';
+                  return (
+                    <div key={optId} className="flex items-center justify-between bg-slate-950 p-2 rounded-xl border border-slate-800 text-xs">
+                      <span className="font-mono text-amber-400 font-bold mr-2">#{idx + 1}</span>
+                      <span className="truncate flex-1 font-medium text-slate-200">{optText}</span>
+                      <div className="flex items-center gap-1 ml-2">
+                        <button
+                          type="button"
+                          onClick={() => moveStageOption(idx, -1)}
+                          disabled={idx === 0}
+                          className="p-1 rounded bg-slate-800 text-slate-300 disabled:opacity-30"
+                        >
+                          <ArrowUp className="w-3 h-3" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => moveStageOption(idx, 1)}
+                          disabled={idx === currentStageGuess.length - 1}
+                          className="p-1 rounded bg-slate-800 text-slate-300 disabled:opacity-30"
+                        >
+                          <ArrowDown className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          {/* Dangerous actions */}
+          <div className="bg-slate-900/80 border border-red-500/20 rounded-3xl p-5 shadow-xl space-y-3">
+            <h3 className="text-xs font-bold text-red-400 uppercase tracking-wider">
+              ⚠️ Room Controls
+            </h3>
+            <button
+              id="admin-clear-votes"
+              onClick={() => {
+                if (confirm('Clear audience votes for this question?')) {
+                  liveSync.clearSubmissions(currentQuestion.id);
+                }
+              }}
+              className="w-full py-2.5 rounded-xl font-bold text-xs bg-red-950/40 border border-red-500/30 text-red-300 hover:bg-red-900/40 transition"
+            >
+              Clear Votes For Current Question
+            </button>
+            <button
+              id="admin-reset-game"
+              onClick={() => {
+                if (confirm('Reset entire game state and all scores?')) {
+                  liveSync.resetGame();
+                }
+              }}
+              className="w-full py-2.5 rounded-xl font-bold text-xs bg-slate-950 border border-slate-800 text-slate-400 hover:text-white transition"
+            >
+              Reset Entire Game
+            </button>
           </div>
         </div>
 
-        {/* Middle Column: God Mode Percentage Override */}
+        {/* Middle & Right Column: God Mode Override & Question Bank */}
         <div className="lg:col-span-2 space-y-6">
+          {/* God Mode Percentage Overrides */}
           <div className="bg-slate-900/90 border-2 border-red-500/40 rounded-3xl p-5 shadow-2xl relative overflow-hidden">
             <div className="flex items-center justify-between mb-4">
               <div className="flex items-center gap-2">
@@ -390,6 +470,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
               </div>
 
               <button
+                id="admin-reset-godmode"
                 onClick={resetManipulations}
                 className="text-xs text-slate-400 hover:text-red-400 border border-slate-700 px-2.5 py-1 rounded-lg"
               >
@@ -398,29 +479,36 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
             </div>
 
             <p className="text-xs text-slate-400 mb-4">
-              Adjust the sliders below to override majority response percentages live. This updates stage board reveals and rankings immediately!
+              Adjust percentages below to override crowd votes. The stage board ranks options automatically based on these values!
             </p>
 
             <div className="space-y-3">
-              {currentQuestion.options.map((option, idx) => {
-                const currentVal = optionOverrides[option.id] ?? option.presetPercentage;
+              {ranking.map((row) => {
+                const option = row.option;
+                const currentPct = row.pct;
+                const isOverridden = row.overridden;
                 return (
                   <div key={option.id} className="bg-slate-950 p-3.5 rounded-2xl border border-slate-800 space-y-2">
                     <div className="flex items-center justify-between text-xs">
                       <span className="font-semibold text-amber-200">
-                        #{idx + 1}. {option.text}
+                        #{row.rank}. {option.text}
                       </span>
-                      <span className="font-mono font-bold text-red-400 bg-red-500/10 px-2 py-0.5 rounded border border-red-500/20">
-                        {currentVal}% Override
-                      </span>
+                      <div className="flex items-center gap-2 font-mono">
+                        <span className="text-slate-400 text-[11px]">
+                          Audience: {row.audiencePct !== null ? `${row.audiencePct}%` : 'no votes'}
+                        </span>
+                        <span className={`px-2 py-0.5 rounded font-bold border ${isOverridden ? 'bg-red-500/20 border-red-500/40 text-red-300' : 'bg-amber-500/10 border-amber-500/30 text-amber-300'}`}>
+                          {currentPct}% {isOverridden ? '(Manipulated)' : ''}
+                        </span>
+                      </div>
                     </div>
 
                     <div className="flex items-center gap-3">
                       <input
                         type="range"
                         min="1"
-                        max="90"
-                        value={currentVal}
+                        max="95"
+                        value={currentPct}
                         onChange={(e) => handlePercentageChange(option.id, parseInt(e.target.value))}
                         className="w-full accent-red-500 cursor-pointer"
                       />
@@ -439,6 +527,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
               </h3>
 
               <button
+                id="admin-toggle-add-question"
                 onClick={() => setIsAddingQuestion(!isAddingQuestion)}
                 className="px-3 py-1.5 rounded-xl text-xs font-bold bg-amber-500/20 border border-amber-500/40 text-amber-300 hover:bg-amber-500/30 transition flex items-center gap-1"
               >
@@ -496,7 +585,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
             {/* Question Selector List */}
             <div className="space-y-2">
               {questions.map((q) => {
-                const isActive = q.id === gameState.currentQuestionId;
+                const isActive = q.id === state.currentQuestionId;
                 return (
                   <div
                     key={q.id}
@@ -519,6 +608,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
                     <div className="flex items-center gap-2 shrink-0">
                       {!isActive && (
                         <button
+                          id={`broadcast-${q.id}`}
                           onClick={() => handleSelectQuestion(q.id)}
                           className="px-3 py-1.5 rounded-xl text-xs font-bold bg-amber-500 text-slate-950 hover:brightness-110"
                         >

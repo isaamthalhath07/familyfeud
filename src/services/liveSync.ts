@@ -1,301 +1,289 @@
-import { GameState, Question, UserSubmission, AudienceMember } from '../types/game';
+/**
+ * Real-time cross-device sync for Parivar Feud.
+ *
+ * Transport: MQTT over secure WebSockets, connected to several free public brokers at once
+ * (redundancy — if one broker is down or blocked by venue Wi-Fi, the others still work).
+ *
+ * Data model: every piece of shared data is one *retained* MQTT topic holding a record
+ *   { rev, by, data }
+ *  - "retained" means the broker keeps the latest value, so a phone that joins late
+ *    instantly receives the current question / phase / votes.
+ *  - `rev` only ever increases. Receivers keep the highest rev per topic, so an old or
+ *    duplicate message (e.g. from a second broker) can never overwrite newer data.
+ *  - data === null is a tombstone (used to clear votes).
+ *
+ * Audience devices NEVER write game state — only Admin and Stage do. That was the root
+ * cause of the old bug where every new phone reset the game to defaults.
+ */
+import mqtt from 'mqtt';
+import type { GameState, Question, UserSubmission } from '../types/game';
 import { DEFAULT_QUESTIONS } from '../data/defaultQuestions';
 
-const CHANNEL_NAME = 'PARIVAR_FEUD_LIVE_SYNC';
-const STORAGE_KEYS = {
-  GAME_STATE: 'PARIVAR_FEUD_STATE_V1',
-  QUESTIONS: 'PARIVAR_FEUD_QUESTIONS_V1',
-  SUBMISSIONS: 'PARIVAR_FEUD_SUBMISSIONS_V1',
-  AUDIENCE: 'PARIVAR_FEUD_AUDIENCE_V1',
-};
+const NAMESPACE = 'parivarfeud/live-v2-k7q9x3m2';
+const TOPIC_STATE = `${NAMESPACE}/state`;
+const TOPIC_QUESTIONS = `${NAMESPACE}/questions`;
+const SUBS_PREFIX = `${NAMESPACE}/subs/`;
 
-// Global High-Speed Cloud Sync Object IDs
-const CLOUD_ENDPOINTS = {
-  GAME_STATE: 'https://api.restful-api.dev/objects/ff808181a09d98f701a103c6ca7f6f37',
-  QUESTIONS: 'https://api.restful-api.dev/objects/ff808181a09d98f701a103c715496f38',
-  SUBMISSIONS: 'https://api.restful-api.dev/objects/ff808181a09d98f701a103c715516f39',
-};
+const BROKERS: { url: string; username?: string; password?: string }[] = [
+  { url: 'wss://broker.emqx.io:8084/mqtt' },
+  { url: 'wss://broker.hivemq.com:8884/mqtt' },
+  { url: 'wss://public.cloud.shiftr.io', username: 'public', password: 'public' }, // port 443 — passes strict venue firewalls
+];
 
-const defaultInitialState: GameState = {
+const ADMIN_CACHE_KEY = 'PARIVAR_FEUD_ADMIN_CACHE_V2';
+
+export const DEFAULT_STATE: GameState = {
   currentQuestionId: DEFAULT_QUESTIONS[0].id,
   phase: 'VOTING',
-  timerSeconds: 60,
-  isTimerRunning: false,
-  stagePlayerName: 'Rahul (Stage Guy)',
-  stagePlayerScore: 0,
+  timerDuration: 60,
+  timerEndsAt: null,
+  timerRemaining: 60,
+  stagePlayerName: 'Stage Contestant',
+  stageGuesses: {},
   revealedOptionIds: [],
-  godModeEnabled: false,
+  finishedQuestionIds: [],
   roomCode: 'FEUD2026',
-  updatedAt: Date.now(),
 };
 
+interface SyncRecord<T = unknown> {
+  rev: number;
+  by: string;
+  data: T | null;
+}
+
+export interface LiveSnapshot {
+  state: GameState;
+  questions: Question[];
+  submissions: UserSubmission[];
+  connectedBrokers: number;
+  totalBrokers: number;
+  synced: boolean; // true once we've received (or confirmed absence of) the live state
+}
+
+type Patch<T> = Partial<T> | ((current: T) => Partial<T>);
+
 class LiveSyncService {
-  private channel: BroadcastChannel | null = null;
-  private stateListeners: Set<(state: GameState) => void> = new Set();
-  private submissionListeners: Set<(subs: UserSubmission[]) => void> = new Set();
-  private questionsListeners: Set<(qs: Question[]) => void> = new Set();
-  private pollInterval: NodeJS.Timeout | null = null;
+  private clientId = 'pf_' + Math.random().toString(36).slice(2, 10);
+  private records = new Map<string, SyncRecord>();
+  private clients: ReturnType<typeof mqtt.connect>[] = [];
+  private connected = new Set<number>();
+  private synced = false;
+  private listeners = new Set<() => void>();
+  private snapshot: LiveSnapshot;
+  private adminMode = false;
+  private healTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
-    // 1. Same-device BroadcastChannel
-    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
-      this.channel = new BroadcastChannel(CHANNEL_NAME);
-      this.channel.onmessage = (event) => {
-        const { type, data } = event.data || {};
-        this.handleIncomingData(type, data);
-      };
-    }
-
-    // 2. Same-device LocalStorage listener
+    this.snapshot = this.buildSnapshot();
     if (typeof window !== 'undefined') {
-      window.addEventListener('storage', (e) => {
-        if (e.key === STORAGE_KEYS.GAME_STATE && e.newValue) {
-          this.notifyStateListeners(JSON.parse(e.newValue));
-        } else if (e.key === STORAGE_KEYS.SUBMISSIONS && e.newValue) {
-          this.notifySubmissionListeners(JSON.parse(e.newValue));
-        } else if (e.key === STORAGE_KEYS.QUESTIONS && e.newValue) {
-          this.notifyQuestionsListeners(JSON.parse(e.newValue));
-        }
-      });
+      BROKERS.forEach((b, i) => this.connectBroker(b, i));
     }
-
-    // 3. Start high-frequency Cloud REST polling (500ms) for cross-device instant sync
-    this.startCloudPolling();
   }
 
-  private startCloudPolling() {
-    if (typeof window === 'undefined') return;
+  // ---------------------------------------------------------------- transport
 
-    this.pollInterval = setInterval(() => {
-      this.fetchCloudGameState();
-    }, 600);
+  private connectBroker(b: (typeof BROKERS)[number], index: number) {
+    const client = mqtt.connect(b.url, {
+      clientId: `${this.clientId}_${index}`,
+      username: b.username,
+      password: b.password,
+      clean: true,
+      keepalive: 30,
+      reconnectPeriod: 2000,
+      connectTimeout: 10_000,
+      protocolVersion: 4,
+    });
+    this.clients[index] = client;
+
+    client.on('connect', () => {
+      this.connected.add(index);
+      client.subscribe([TOPIC_STATE, TOPIC_QUESTIONS, `${SUBS_PREFIX}#`], { qos: 1 }, (err) => {
+        if (err) return;
+        // Retained messages arrive right after SUBACK. If nothing arrives, no game has been
+        // started yet — defaults are correct.
+        setTimeout(() => this.markSynced(), 1500);
+        if (this.adminMode) setTimeout(() => this.republish(client, true), 3000);
+      });
+      this.emit();
+    });
+
+    const onDown = () => {
+      if (this.connected.delete(index)) this.emit();
+    };
+    client.on('close', onDown);
+    client.on('offline', onDown);
+    client.on('error', () => {
+      /* mqtt.js auto-reconnects */
+    });
+
+    client.on('message', (topic, payload) => this.receive(topic, payload));
   }
 
-  private async fetchCloudGameState() {
+  private receive(topic: string, payload: Uint8Array) {
+    if (!payload || payload.length === 0) return;
+    let rec: SyncRecord;
     try {
-      const res = await fetch(CLOUD_ENDPOINTS.GAME_STATE, { cache: 'no-store' });
-      if (!res.ok) return;
-      const body = await res.json();
-      if (body && body.data) {
-        const cloudState = body.data as GameState;
-        const currentLocal = this.getGameState();
-        
-        if (!currentLocal || cloudState.updatedAt > (currentLocal.updatedAt || 0)) {
-          if (typeof localStorage !== 'undefined') {
-            localStorage.setItem(STORAGE_KEYS.GAME_STATE, JSON.stringify(cloudState));
-          }
-          this.notifyStateListeners(cloudState);
-        }
-      }
+      rec = JSON.parse(new TextDecoder().decode(payload));
     } catch {
-      // Network drop fallback
+      return;
     }
+    if (!rec || typeof rec.rev !== 'number') return;
+
+    const prev = this.records.get(topic);
+    const newer = !prev || rec.rev > prev.rev || (rec.rev === prev.rev && String(rec.by) > String(prev.by));
+    if (!newer) return;
+
+    this.records.set(topic, rec);
+    if (topic === TOPIC_STATE) this.synced = true;
+    this.emit();
   }
 
-  private async pushCloudGameState(state: GameState) {
-    try {
-      await fetch(CLOUD_ENDPOINTS.GAME_STATE, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: 'GameState',
-          data: state,
-        }),
-      });
-    } catch {
-      // Push error fallback
-    }
-  }
-
-  private async pushCloudQuestions(questions: Question[]) {
-    try {
-      await fetch(CLOUD_ENDPOINTS.QUESTIONS, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: 'QuestionsState',
-          data: questions,
-        }),
-      });
-    } catch {}
-  }
-
-  private async pushCloudSubmissions(subs: UserSubmission[]) {
-    try {
-      await fetch(CLOUD_ENDPOINTS.SUBMISSIONS, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          name: 'SubmissionsState',
-          data: subs,
-        }),
-      });
-    } catch {}
-  }
-
-  private handleIncomingData(type: string, data: any) {
-    if (!data) return;
-    if (type === 'GAME_STATE_UPDATE') {
-      const current = this.getGameState();
-      if (!current || data.updatedAt > (current.updatedAt || 0)) {
-        if (typeof localStorage !== 'undefined') {
-          localStorage.setItem(STORAGE_KEYS.GAME_STATE, JSON.stringify(data));
-        }
-        this.notifyStateListeners(data);
-      }
-    } else if (type === 'SUBMISSIONS_UPDATE') {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.setItem(STORAGE_KEYS.SUBMISSIONS, JSON.stringify(data));
-      }
-      this.notifySubmissionListeners(data);
-    } else if (type === 'QUESTIONS_UPDATE') {
-      if (typeof localStorage !== 'undefined') {
-        localStorage.setItem(STORAGE_KEYS.QUESTIONS, JSON.stringify(data));
-      }
-      this.notifyQuestionsListeners(data);
-    }
-  }
-
-  // --- GAME STATE ---
-  getGameState(): GameState {
-    if (typeof localStorage === 'undefined') return defaultInitialState;
-    const raw = localStorage.getItem(STORAGE_KEYS.GAME_STATE);
-    if (!raw) {
-      this.saveGameState(defaultInitialState);
-      return defaultInitialState;
-    }
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return defaultInitialState;
-    }
-  }
-
-  saveGameState(state: GameState) {
-    const updated = { ...state, updatedAt: Date.now() };
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEYS.GAME_STATE, JSON.stringify(updated));
-    }
-    if (this.channel) {
+  private publish(topic: string, rec: SyncRecord, only?: ReturnType<typeof mqtt.connect>) {
+    const msg = JSON.stringify(rec);
+    (only ? [only] : this.clients).forEach((c) => {
       try {
-        this.channel.postMessage({ type: 'GAME_STATE_UPDATE', data: updated });
-      } catch {}
+        // QoS 1 messages are queued by mqtt.js while offline and flushed on reconnect.
+        c.publish(topic, msg, { qos: 1, retain: true });
+      } catch {
+        /* ignore */
+      }
+    });
+  }
+
+  private write<T>(topic: string, data: T | null) {
+    const prev = this.records.get(topic);
+    // Monotonic: never lower than anything we've seen for this topic.
+    const rev = Math.max(Date.now(), (prev?.rev ?? 0) + 1);
+    const rec: SyncRecord<T> = { rev, by: this.clientId, data };
+    this.records.set(topic, rec);
+    this.emit();
+    this.publish(topic, rec);
+  }
+
+  private markSynced() {
+    if (!this.synced) {
+      this.synced = true;
+      this.emit();
     }
-    this.notifyStateListeners(updated);
-
-    // Push to global cloud KV store instantly
-    this.pushCloudGameState(updated);
   }
 
-  subscribeGameState(callback: (state: GameState) => void): () => void {
-    this.stateListeners.add(callback);
-    callback(this.getGameState());
-    return () => this.stateListeners.delete(callback);
-  }
+  // ---------------------------------------------------------------- admin self-healing
 
-  private notifyStateListeners(state: GameState) {
-    this.stateListeners.forEach((cb) => cb(state));
-  }
+  /** Admin keeps the brokers' retained data fresh (in case a public broker restarts mid-event). */
+  enableAdminMode() {
+    if (this.adminMode || typeof window === 'undefined') return;
+    this.adminMode = true;
 
-  // --- QUESTIONS ---
-  getQuestions(): Question[] {
-    if (typeof localStorage === 'undefined') return DEFAULT_QUESTIONS;
-    const raw = localStorage.getItem(STORAGE_KEYS.QUESTIONS);
-    if (!raw) {
-      this.saveQuestions(DEFAULT_QUESTIONS);
-      return DEFAULT_QUESTIONS;
-    }
+    // Restore last known state/questions from this browser (merged by rev, so never regresses).
     try {
-      return JSON.parse(raw);
+      const cache = JSON.parse(localStorage.getItem(ADMIN_CACHE_KEY) || '{}') as Record<string, SyncRecord>;
+      Object.entries(cache).forEach(([topic, rec]) => {
+        const prev = this.records.get(topic);
+        if (rec && typeof rec.rev === 'number' && (!prev || rec.rev > prev.rev)) this.records.set(topic, rec);
+      });
+      this.emit();
     } catch {
-      return DEFAULT_QUESTIONS;
+      /* ignore */
     }
+
+    this.clients.forEach((c, i) => {
+      if (this.connected.has(i)) setTimeout(() => this.republish(c, true), 3000);
+    });
+    this.healTimer = setInterval(() => this.clients.forEach((c, i) => this.connected.has(i) && this.republish(c, false)), 60_000);
   }
 
-  saveQuestions(questions: Question[]) {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEYS.QUESTIONS, JSON.stringify(questions));
-    }
-    if (this.channel) {
-      try {
-        this.channel.postMessage({ type: 'QUESTIONS_UPDATE', data: questions });
-      } catch {}
-    }
-    this.notifyQuestionsListeners(questions);
-    this.pushCloudQuestions(questions);
+  private republish(client: ReturnType<typeof mqtt.connect>, includeVotes: boolean) {
+    this.records.forEach((rec, topic) => {
+      if (!includeVotes && topic.startsWith(SUBS_PREFIX)) return;
+      this.publish(topic, rec, client);
+    });
   }
 
-  subscribeQuestions(callback: (qs: Question[]) => void): () => void {
-    this.questionsListeners.add(callback);
-    callback(this.getQuestions());
-    return () => this.questionsListeners.delete(callback);
-  }
-
-  private notifyQuestionsListeners(qs: Question[]) {
-    this.questionsListeners.forEach((cb) => cb(qs));
-  }
-
-  // --- USER SUBMISSIONS ---
-  getSubmissions(): UserSubmission[] {
-    if (typeof localStorage === 'undefined') return [];
-    const raw = localStorage.getItem(STORAGE_KEYS.SUBMISSIONS);
-    if (!raw) return [];
+  private cacheForAdmin() {
+    if (!this.adminMode) return;
     try {
-      return JSON.parse(raw);
+      const cache: Record<string, SyncRecord> = {};
+      [TOPIC_STATE, TOPIC_QUESTIONS].forEach((t) => {
+        const r = this.records.get(t);
+        if (r) cache[t] = r;
+      });
+      localStorage.setItem(ADMIN_CACHE_KEY, JSON.stringify(cache));
     } catch {
-      return [];
+      /* ignore */
     }
   }
 
-  addSubmission(sub: UserSubmission) {
-    const list = this.getSubmissions();
-    const filtered = list.filter((s) => !(s.userId === sub.userId && s.questionId === sub.questionId));
-    filtered.push(sub);
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEYS.SUBMISSIONS, JSON.stringify(filtered));
-    }
-    if (this.channel) {
-      try {
-        this.channel.postMessage({ type: 'SUBMISSIONS_UPDATE', data: filtered });
-      } catch {}
-    }
-    this.notifySubmissionListeners(filtered);
-    this.pushCloudSubmissions(filtered);
+  // ---------------------------------------------------------------- store API (React)
+
+  private buildSnapshot(): LiveSnapshot {
+    const stateRec = this.records.get(TOPIC_STATE)?.data as Partial<GameState> | null | undefined;
+    const qRec = this.records.get(TOPIC_QUESTIONS)?.data as Question[] | null | undefined;
+    const submissions: UserSubmission[] = [];
+    this.records.forEach((rec, topic) => {
+      if (topic.startsWith(SUBS_PREFIX) && rec.data) submissions.push(rec.data as UserSubmission);
+    });
+    const questions = Array.isArray(qRec) && qRec.length > 0 ? qRec : DEFAULT_QUESTIONS;
+    return {
+      state: { ...DEFAULT_STATE, ...(stateRec || {}) },
+      questions,
+      submissions,
+      connectedBrokers: this.connected.size,
+      totalBrokers: BROKERS.length,
+      synced: this.synced,
+    };
   }
 
-  subscribeSubmissions(callback: (subs: UserSubmission[]) => void): () => void {
-    this.submissionListeners.add(callback);
-    callback(this.getSubmissions());
-    return () => this.submissionListeners.delete(callback);
+  private emit() {
+    this.snapshot = this.buildSnapshot();
+    this.cacheForAdmin();
+    this.listeners.forEach((l) => l());
   }
 
-  private notifySubmissionListeners(subs: UserSubmission[]) {
-    this.submissionListeners.forEach((cb) => cb(subs));
+  subscribe = (listener: () => void) => {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  };
+
+  getSnapshot = () => this.snapshot;
+
+  // ---------------------------------------------------------------- game actions
+
+  updateState(patch: Patch<GameState>) {
+    const current = this.snapshot.state;
+    const changes = typeof patch === 'function' ? patch(current) : patch;
+    this.write<GameState>(TOPIC_STATE, { ...current, ...changes });
   }
 
-  // --- AUDIENCE MEMBERS ---
-  getAudienceMembers(): AudienceMember[] {
-    if (typeof localStorage === 'undefined') return [];
-    const raw = localStorage.getItem(STORAGE_KEYS.AUDIENCE);
-    if (!raw) return [];
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return [];
-    }
+  setQuestions(next: Question[] | ((current: Question[]) => Question[])) {
+    const value = typeof next === 'function' ? next(this.snapshot.questions) : next;
+    this.write<Question[]>(TOPIC_QUESTIONS, value);
   }
 
-  saveAudienceMember(member: AudienceMember) {
-    const list = this.getAudienceMembers();
-    const index = list.findIndex((m) => m.id === member.id);
-    if (index >= 0) {
-      list[index] = member;
-    } else {
-      list.push(member);
-    }
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEYS.AUDIENCE, JSON.stringify(list));
-    }
+  submitRanking(sub: UserSubmission) {
+    this.write<UserSubmission>(`${SUBS_PREFIX}${sub.questionId}/${sub.userId}`, sub);
+  }
+
+  /** Clears votes for one question (or every question when questionId is omitted). */
+  clearSubmissions(questionId?: string) {
+    const prefix = questionId ? `${SUBS_PREFIX}${questionId}/` : SUBS_PREFIX;
+    Array.from(this.records.entries()).forEach(([topic, rec]) => {
+      if (topic.startsWith(prefix) && rec.data) this.write(topic, null);
+    });
+  }
+
+  resetGame() {
+    this.clearSubmissions();
+    const s = this.snapshot.state;
+    this.write<GameState>(TOPIC_STATE, {
+      ...DEFAULT_STATE,
+      currentQuestionId: this.snapshot.questions[0]?.id ?? DEFAULT_STATE.currentQuestionId,
+      stagePlayerName: s.stagePlayerName,
+      timerDuration: s.timerDuration,
+      timerRemaining: s.timerDuration,
+      roomCode: s.roomCode,
+    });
   }
 }
 

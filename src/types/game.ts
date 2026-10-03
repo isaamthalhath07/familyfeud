@@ -1,51 +1,50 @@
 export interface AnswerOption {
   id: string;
   text: string;
-  presetPercentage: number; // Original default percentage
-  manipulatedPercentage?: number; // Override percentage by Admin (God mode)
+  presetPercentage: number; // Fallback % used only when nobody has voted yet
+  manipulatedPercentage?: number; // Admin "God Mode" override (wins over real votes)
   presetPoints: number;
-  revealed?: boolean;
 }
 
 export interface Question {
   id: string;
   title: string;
-  category: 'Gandhi Special' | 'Indian Parivar' | 'Dark Satire' | 'Historical Twist';
+  category: string;
   options: AnswerOption[];
   darkHumorTrivia?: string;
   bapuCommentary?: string;
 }
 
-export type GamePhase = 'LOBBY' | 'VOTING' | 'LOCKED' | 'STAGE_GUESSING' | 'REVEALED';
+export type GamePhase = 'VOTING' | 'LOCKED' | 'STAGE_GUESSING' | 'REVEALED';
 
 export interface GameState {
   currentQuestionId: string;
   phase: GamePhase;
-  timerSeconds: number;
-  isTimerRunning: boolean;
+
+  // Timer — clients compute remaining time locally from timerEndsAt
+  timerDuration: number; // seconds per round (admin configurable)
+  timerEndsAt: number | null; // epoch ms when running, null when paused/stopped
+  timerRemaining: number; // seconds left while paused
+
   stagePlayerName: string;
-  stagePlayerScore: number;
-  revealedOptionIds: string[]; // Options revealed on Stage Board
-  godModeEnabled: boolean;
-  customOptionOrder?: string[]; // Admin forced ranking order of option IDs
+  stageGuesses: Record<string, string[]>; // questionId -> option ids in the order the stage guy guessed
+  revealedOptionIds: string[]; // option ids flipped on the stage board (current question)
+  finishedQuestionIds: string[]; // questions that reached REVEALED (count toward scores)
   roomCode: string;
-  updatedAt: number;
 }
 
 export interface UserSubmission {
   userId: string;
   userName: string;
+  avatar: string;
   questionId: string;
-  rankedOptionIds: string[]; // 1st place to 5th place
-  scoreGained: number;
+  rankedOptionIds: string[]; // index 0 = predicted most popular
   submittedAt: number;
 }
 
 export interface AudienceMember {
   id: string;
   name: string;
-  totalScore: number;
-  streak: number;
   avatar: string;
   badge: string;
 }
