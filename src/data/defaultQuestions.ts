@@ -1,4 +1,4 @@
-import { Question } from '../types/game';
+import type { Question } from '../types/game';
 
 export const DEFAULT_QUESTIONS: Question[] = [
   {
