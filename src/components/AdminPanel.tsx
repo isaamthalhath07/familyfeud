@@ -1,21 +1,27 @@
 import React, { useState, useEffect } from 'react';
-import { GameState, Question, AnswerOption } from '../types/game';
+import { GameState, Question } from '../types/game';
 import { liveSync } from '../services/liveSync';
 import { sfx } from '../services/soundEffects';
-import { ShieldAlert, Play, Pause, RotateCcw, Sliders, Plus, Trash2, Edit3, Save, CheckCircle, Volume2, Lock, Flame } from 'lucide-react';
+import { ShieldAlert, Play, Pause, RotateCcw, Sliders, Plus, Trash2, Flame, Lock, KeyRound, LogOut, CheckCircle } from 'lucide-react';
 
 interface AdminPanelProps {
   gameState: GameState;
   questions: Question[];
 }
 
+const SECRET_PIN = 'isaam';
+
 export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) => {
+  const [isAuthenticated, setIsAuthenticated] = useState<boolean>(() => {
+    return sessionStorage.getItem('PARIVAR_ADMIN_AUTH') === 'true';
+  });
+  const [pinInput, setPinInput] = useState('');
+  const [pinError, setPinError] = useState(false);
+
   const currentQuestion = questions.find((q) => q.id === gameState.currentQuestionId) || questions[0];
 
   // Local state for God Mode overrides
-  const [godModeActive, setGodModeActive] = useState<boolean>(gameState.godModeEnabled);
   const [optionOverrides, setOptionOverrides] = useState<Record<string, number>>({});
-  const [timerInput, setTimerInput] = useState<number>(gameState.timerSeconds);
   const [stageGuyName, setStageGuyName] = useState<string>(gameState.stagePlayerName);
 
   // New question form state
@@ -61,6 +67,73 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
       if (interval) clearInterval(interval);
     };
   }, [gameState]);
+
+  const handlePinSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (pinInput.trim().toLowerCase() === SECRET_PIN) {
+      sessionStorage.setItem('PARIVAR_ADMIN_AUTH', 'true');
+      setIsAuthenticated(true);
+      setPinError(false);
+      sfx.playVictory();
+    } else {
+      setPinError(true);
+      sfx.playBuzzer();
+    }
+  };
+
+  const handleLogout = () => {
+    sessionStorage.removeItem('PARIVAR_ADMIN_AUTH');
+    setIsAuthenticated(false);
+    setPinInput('');
+  };
+
+  // If not authenticated with PIN "isaam"
+  if (!isAuthenticated) {
+    return (
+      <div className="min-h-[80vh] flex items-center justify-center p-4">
+        <div className="w-full max-w-md bg-slate-900/90 border-2 border-red-500/40 rounded-3xl p-6 sm:p-8 shadow-2xl backdrop-blur-xl text-center space-y-6 relative overflow-hidden">
+          <div className="w-14 h-14 rounded-2xl bg-red-500/20 border border-red-500/40 flex items-center justify-center text-red-400 mx-auto">
+            <KeyRound className="w-7 h-7" />
+          </div>
+
+          <div>
+            <h2 className="text-2xl font-black text-slate-100 tracking-tight">Admin Secret Access</h2>
+            <p className="text-xs text-slate-400 mt-1">Enter the secret PIN to unlock God Mode & Stage Controls.</p>
+          </div>
+
+          <form onSubmit={handlePinSubmit} className="space-y-4">
+            <div>
+              <input
+                type="password"
+                required
+                placeholder="Enter Secret PIN"
+                value={pinInput}
+                onChange={(e) => {
+                  setPinInput(e.target.value);
+                  setPinError(false);
+                }}
+                className={`w-full text-center tracking-widest text-lg font-mono bg-slate-950 border rounded-2xl py-3.5 px-4 text-amber-200 outline-none transition ${
+                  pinError ? 'border-red-500 ring-2 ring-red-500/30' : 'border-slate-700 focus:border-amber-500'
+                }`}
+              />
+              {pinError && (
+                <p className="text-xs font-bold text-red-400 mt-2">
+                  ❌ Incorrect Secret PIN. Try again!
+                </p>
+              )}
+            </div>
+
+            <button
+              type="submit"
+              className="w-full py-3.5 rounded-2xl font-bold bg-gradient-to-r from-red-600 via-amber-600 to-red-500 text-white shadow-xl shadow-red-500/20 hover:brightness-110 active:scale-[0.99] transition text-sm"
+            >
+              Unlock Admin Panel
+            </button>
+          </form>
+        </div>
+      </div>
+    );
+  }
 
   const handleSelectQuestion = (qId: string) => {
     liveSync.saveGameState({
@@ -113,7 +186,6 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
     const updatedOverrides = { ...optionOverrides, [optionId]: val };
     setOptionOverrides(updatedOverrides);
 
-    // Apply to questions array and save
     const updatedQuestions = questions.map((q) => {
       if (q.id === currentQuestion.id) {
         return {
@@ -214,21 +286,31 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
           </div>
         </div>
 
-        {/* Phase Badges */}
-        <div className="flex items-center gap-1.5 bg-slate-950 p-1.5 rounded-2xl border border-slate-800 text-xs font-semibold">
-          {(['VOTING', 'LOCKED', 'STAGE_GUESSING', 'REVEALED'] as GameState['phase'][]).map((phase) => (
-            <button
-              key={phase}
-              onClick={() => handlePhaseChange(phase)}
-              className={`px-3 py-1.5 rounded-xl transition ${
-                gameState.phase === phase
-                  ? 'bg-red-500 text-white font-bold shadow-md shadow-red-500/30'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              {phase}
-            </button>
-          ))}
+        <div className="flex items-center gap-2">
+          {/* Phase Badges */}
+          <div className="flex items-center gap-1.5 bg-slate-950 p-1.5 rounded-2xl border border-slate-800 text-xs font-semibold">
+            {(['VOTING', 'LOCKED', 'STAGE_GUESSING', 'REVEALED'] as GameState['phase'][]).map((phase) => (
+              <button
+                key={phase}
+                onClick={() => handlePhaseChange(phase)}
+                className={`px-3 py-1.5 rounded-xl transition ${
+                  gameState.phase === phase
+                    ? 'bg-red-500 text-white font-bold shadow-md shadow-red-500/30'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                {phase}
+              </button>
+            ))}
+          </div>
+
+          <button
+            onClick={handleLogout}
+            className="p-2.5 rounded-2xl bg-slate-950 border border-slate-800 text-slate-400 hover:text-red-400 transition"
+            title="Lock Admin Panel"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
         </div>
       </div>
 
@@ -353,7 +435,7 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({ gameState, questions }) 
           <div className="bg-slate-900/80 border border-slate-800 rounded-3xl p-5 shadow-xl space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="font-bold text-base text-slate-100 flex items-center gap-2">
-                <Flame className="w-5 h-5 text-amber-400" /> Question Bank Manager
+                <Flame className="w-5 h-5 text-amber-400" /> Question Bank Manager ({questions.length} Questions)
               </h3>
 
               <button
