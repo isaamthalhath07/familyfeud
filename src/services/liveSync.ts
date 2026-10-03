@@ -1,5 +1,6 @@
 import { GameState, Question, UserSubmission, AudienceMember } from '../types/game';
 import { DEFAULT_QUESTIONS } from '../data/defaultQuestions';
+import { Peer, DataConnection } from 'peerjs';
 
 const CHANNEL_NAME = 'PARIVAR_FEUD_LIVE_SYNC';
 const STORAGE_KEYS = {
@@ -8,6 +9,12 @@ const STORAGE_KEYS = {
   SUBMISSIONS: 'PARIVAR_FEUD_SUBMISSIONS_V1',
   AUDIENCE: 'PARIVAR_FEUD_AUDIENCE_V1',
 };
+
+// Public WebSocket relays for zero-config cross-device internet sync
+const WS_RELAYS = [
+  'wss://socketsbay.com/wss/v2/1/demo/',
+  'wss://free.websocket.org',
+];
 
 const defaultInitialState: GameState = {
   currentQuestionId: DEFAULT_QUESTIONS[0].id,
@@ -28,21 +35,22 @@ class LiveSyncService {
   private submissionListeners: Set<(subs: UserSubmission[]) => void> = new Set();
   private questionsListeners: Set<(qs: Question[]) => void> = new Set();
 
+  private peer: Peer | null = null;
+  private connections: Map<string, DataConnection> = new Map();
+  private ws: WebSocket | null = null;
+  private roomPeerId = 'parivar-feud-host-feud2026';
+
   constructor() {
+    // 1. Same-device BroadcastChannel
     if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
       this.channel = new BroadcastChannel(CHANNEL_NAME);
       this.channel.onmessage = (event) => {
         const { type, data } = event.data || {};
-        if (type === 'GAME_STATE_UPDATE') {
-          this.notifyStateListeners(data);
-        } else if (type === 'SUBMISSIONS_UPDATE') {
-          this.notifySubmissionListeners(data);
-        } else if (type === 'QUESTIONS_UPDATE') {
-          this.notifyQuestionsListeners(data);
-        }
+        this.handleIncomingMessage(type, data);
       };
     }
 
+    // 2. Same-device LocalStorage listener
     if (typeof window !== 'undefined') {
       window.addEventListener('storage', (e) => {
         if (e.key === STORAGE_KEYS.GAME_STATE && e.newValue) {
@@ -54,6 +62,141 @@ class LiveSyncService {
         }
       });
     }
+
+    // 3. Cross-Device Public WebSocket Mesh
+    this.initWebSocketRelay();
+
+    // 4. Cross-Device PeerJS WebRTC Channel
+    this.initPeerJS();
+  }
+
+  private handleIncomingMessage(type: string, data: any) {
+    if (!data) return;
+    if (type === 'GAME_STATE_UPDATE') {
+      const current = this.getGameState();
+      if (!current || data.updatedAt > (current.updatedAt || 0)) {
+        if (typeof localStorage !== 'undefined') {
+          localStorage.setItem(STORAGE_KEYS.GAME_STATE, JSON.stringify(data));
+        }
+        this.notifyStateListeners(data);
+      }
+    } else if (type === 'SUBMISSIONS_UPDATE') {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(STORAGE_KEYS.SUBMISSIONS, JSON.stringify(data));
+      }
+      this.notifySubmissionListeners(data);
+    } else if (type === 'QUESTIONS_UPDATE') {
+      if (typeof localStorage !== 'undefined') {
+        localStorage.setItem(STORAGE_KEYS.QUESTIONS, JSON.stringify(data));
+      }
+      this.notifyQuestionsListeners(data);
+    }
+  }
+
+  // Cross-device WebSocket Relay setup
+  private initWebSocketRelay() {
+    if (typeof window === 'undefined') return;
+    try {
+      this.ws = new WebSocket(WS_RELAYS[0]);
+      
+      this.ws.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(event.data);
+          if (payload.room === defaultInitialState.roomCode) {
+            this.handleIncomingMessage(payload.type, payload.data);
+          }
+        } catch {
+          // ignore non-json messages
+        }
+      };
+
+      this.ws.onerror = () => {
+        // Fallback reconnection after 3 seconds
+        setTimeout(() => this.initWebSocketRelay(), 3000);
+      };
+    } catch {
+      // SILENT FALLBACK
+    }
+  }
+
+  // Cross-device PeerJS WebRTC mesh setup
+  private initPeerJS() {
+    if (typeof window === 'undefined') return;
+
+    try {
+      // Generate a deterministic or random peer id
+      const randomId = 'p_' + Math.random().toString(36).substring(2, 9);
+      this.peer = new Peer(randomId, {
+        debug: 0,
+      });
+
+      this.peer.on('open', () => {
+        // Connect to host peer
+        this.connectToHostPeer();
+      });
+
+      this.peer.on('connection', (conn) => {
+        this.connections.set(conn.peer, conn);
+        conn.on('data', (data: any) => {
+          if (data && data.type) {
+            this.handleIncomingMessage(data.type, data.data);
+          }
+        });
+        conn.on('close', () => this.connections.delete(conn.peer));
+
+        // Immediately send current game state to newly connected client
+        conn.send({ type: 'GAME_STATE_UPDATE', data: this.getGameState() });
+        conn.send({ type: 'QUESTIONS_UPDATE', data: this.getQuestions() });
+        conn.send({ type: 'SUBMISSIONS_UPDATE', data: this.getSubmissions() });
+      });
+
+    } catch {
+      // PeerJS init fallback
+    }
+  }
+
+  private connectToHostPeer() {
+    if (!this.peer) return;
+    try {
+      const conn = this.peer.connect(this.roomPeerId);
+      conn.on('open', () => {
+        this.connections.set(this.roomPeerId, conn);
+      });
+      conn.on('data', (data: any) => {
+        if (data && data.type) {
+          this.handleIncomingMessage(data.type, data.data);
+        }
+      });
+    } catch {
+      // silent catch
+    }
+  }
+
+  private broadcastToAll(type: string, data: any) {
+    const payload = { room: defaultInitialState.roomCode, type, data };
+
+    // 1. BroadcastChannel (same browser tabs)
+    if (this.channel) {
+      try {
+        this.channel.postMessage({ type, data });
+      } catch {}
+    }
+
+    // 2. WebSocket Relay (cross-device public internet)
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(JSON.stringify(payload));
+      } catch {}
+    }
+
+    // 3. PeerJS Connections (WebRTC P2P mesh)
+    this.connections.forEach((conn) => {
+      if (conn.open) {
+        try {
+          conn.send({ type, data });
+        } catch {}
+      }
+    });
   }
 
   // --- GAME STATE ---
@@ -76,9 +219,7 @@ class LiveSyncService {
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(STORAGE_KEYS.GAME_STATE, JSON.stringify(updated));
     }
-    if (this.channel) {
-      this.channel.postMessage({ type: 'GAME_STATE_UPDATE', data: updated });
-    }
+    this.broadcastToAll('GAME_STATE_UPDATE', updated);
     this.notifyStateListeners(updated);
   }
 
@@ -111,9 +252,7 @@ class LiveSyncService {
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(STORAGE_KEYS.QUESTIONS, JSON.stringify(questions));
     }
-    if (this.channel) {
-      this.channel.postMessage({ type: 'QUESTIONS_UPDATE', data: questions });
-    }
+    this.broadcastToAll('QUESTIONS_UPDATE', questions);
     this.notifyQuestionsListeners(questions);
   }
 
@@ -146,31 +285,8 @@ class LiveSyncService {
     if (typeof localStorage !== 'undefined') {
       localStorage.setItem(STORAGE_KEYS.SUBMISSIONS, JSON.stringify(filtered));
     }
-    if (this.channel) {
-      this.channel.postMessage({ type: 'SUBMISSIONS_UPDATE', data: filtered });
-    }
+    this.broadcastToAll('SUBMISSIONS_UPDATE', filtered);
     this.notifySubmissionListeners(filtered);
-  }
-
-  clearSubmissionsForQuestion(questionId: string) {
-    const list = this.getSubmissions().filter((s) => s.questionId !== questionId);
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEYS.SUBMISSIONS, JSON.stringify(list));
-    }
-    if (this.channel) {
-      this.channel.postMessage({ type: 'SUBMISSIONS_UPDATE', data: list });
-    }
-    this.notifySubmissionListeners(list);
-  }
-
-  clearAllSubmissions() {
-    if (typeof localStorage !== 'undefined') {
-      localStorage.setItem(STORAGE_KEYS.SUBMISSIONS, JSON.stringify([]));
-    }
-    if (this.channel) {
-      this.channel.postMessage({ type: 'SUBMISSIONS_UPDATE', data: [] });
-    }
-    this.notifySubmissionListeners([]);
   }
 
   subscribeSubmissions(callback: (subs: UserSubmission[]) => void): () => void {
@@ -183,7 +299,7 @@ class LiveSyncService {
     this.submissionListeners.forEach((cb) => cb(subs));
   }
 
-  // --- AUDIENCE MEMBERS & LEADERBOARD ---
+  // --- AUDIENCE MEMBERS ---
   getAudienceMembers(): AudienceMember[] {
     if (typeof localStorage === 'undefined') return [];
     const raw = localStorage.getItem(STORAGE_KEYS.AUDIENCE);

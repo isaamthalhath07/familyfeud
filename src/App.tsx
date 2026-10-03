@@ -7,7 +7,6 @@ import { StageDisplayView } from './components/StageDisplayView';
 import { AdminPanel } from './components/AdminPanel';
 
 export function App() {
-  // Derive view from pathname (/admin, /stage, / or /audience)
   const getInitialView = (): 'audience' | 'stage' | 'admin' => {
     const path = window.location.pathname.toLowerCase();
     if (path.startsWith('/admin')) return 'admin';
@@ -19,14 +18,12 @@ export function App() {
   const [gameState, setGameState] = useState<GameState>(liveSync.getGameState());
   const [questions, setQuestions] = useState<Question[]>(liveSync.getQuestions());
 
-  // Handle URL change
   const handleViewChange = (view: 'audience' | 'stage' | 'admin') => {
     setCurrentView(view);
     const newPath = view === 'audience' ? '/' : `/${view}`;
     window.history.pushState(null, '', newPath);
   };
 
-  // Sync with browser back/forward buttons
   useEffect(() => {
     const onPopState = () => {
       setCurrentView(getInitialView());
@@ -38,9 +35,17 @@ export function App() {
   useEffect(() => {
     const unsubState = liveSync.subscribeGameState(setGameState);
     const unsubQuestions = liveSync.subscribeQuestions(setQuestions);
+
+    // Heartbeat check every 1.5s to ensure cross-device synchronization
+    const heartbeat = setInterval(() => {
+      setGameState(liveSync.getGameState());
+      setQuestions(liveSync.getQuestions());
+    }, 1500);
+
     return () => {
       unsubState();
       unsubQuestions();
+      clearInterval(heartbeat);
     };
   }, []);
 
@@ -68,7 +73,7 @@ export function App() {
 
       {/* Footer */}
       <footer className="border-t border-slate-900 bg-slate-950/80 py-4 text-center text-xs text-slate-500">
-        <p>Parivar Feud • Gandhi & Indian Family Dark Satire Game Show • Live Sync Enabled</p>
+        <p>Parivar Feud • Gandhi & Indian Family Dark Satire Game Show • Live Cross-Device Sync Active</p>
       </footer>
     </div>
   );
