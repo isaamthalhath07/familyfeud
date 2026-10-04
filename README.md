@@ -10,7 +10,7 @@ Audience members join on their phones to rank options by popularity, while a sta
 
 - **📱 Mobile Audience View (`/`)**: Touch-friendly interface allowing audience members to re-order options from #1 to #5 using tap and drag controls. Automatically computes scores and assigns satirical rank badges.
 - **📺 Stage TV Display (`/stage`)**: Broadcast-ready TV studio interface with animated flip cards, Web Audio API sound effects (dings, buzzers, suspense drumrolls), live crowd consensus progress bars, and victory confetti.
-- **🛠️ Admin Control Panel (`/admin`)**: Protected by secret PIN (`isaam`). Allows host to start/pause voting timers, change phases (`VOTING`, `LOCKED`, `STAGE_GUESSING`, `REVEALED`), broadcast questions, and adjust answer option percentages live in real-time.
+- **🛠️ Admin Control Panel (`/admin`)**: Protected by secret PIN . Allows host to start/pause voting timers, change phases (`VOTING`, `LOCKED`, `STAGE_GUESSING`, `REVEALED`), broadcast questions, and adjust answer option percentages live in real-time.
 - **⚡ Instant Cross-Device Sync**: Multi-broker MQTT over WebSockets connection ensuring instant state synchronization across different devices and mobile networks (Wi-Fi, 4G, 5G).
 
 ---
